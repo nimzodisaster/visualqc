@@ -11,13 +11,16 @@ import textwrap
 import time
 import traceback
 from abc import ABC
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from os import makedirs
 from pathlib import Path
+from shutil import which
 from subprocess import check_output
 from warnings import catch_warnings, filterwarnings
 
 import matplotlib.image as mpimg
 import numpy as np
+from nibabel.freesurfer import io as fsio
 from matplotlib import cm, colors, pyplot as plt
 from matplotlib.colors import is_color_like
 from matplotlib.widgets import RadioButtons, Slider
@@ -38,6 +41,29 @@ from visualqc.utils import (check_alpha_set, check_event_in_axes, check_finite_i
 from visualqc.workflows import BaseWorkflowVisualQC
 
 next_click = time.monotonic()
+_PYVISTA_READY = False
+
+
+def _prepare_pyvista_backend():
+    """Initializes PyVista for headless rendering when available."""
+
+    global _PYVISTA_READY
+    try:
+        import pyvista as pv
+    except ImportError:
+        return None
+
+    if not _PYVISTA_READY:
+        try:
+            pv.start_xvfb()
+        except Exception:
+            # start_xvfb is not available on all platforms
+            pass
+        pv.global_theme.lighting = True
+        pv.global_theme.off_screen = True
+        _PYVISTA_READY = True
+
+    return pv
 
 
 class FreesurferReviewInterface(BaseReviewInterface):
@@ -296,7 +322,9 @@ class FreesurferRatingWorkflow(BaseWorkflowVisualQC, ABC):
                  views=cfg.default_views,
                  num_slices_per_view=cfg.default_num_slices,
                  num_rows_per_view=cfg.default_num_rows,
-                 screenshot_only=cfg.default_screenshot_only):
+                 screenshot_only=cfg.default_screenshot_only,
+                 surface_vis_backend=cfg.freesurfer_vis_cmd,
+                 surface_worker_threads=cfg.default_surface_workers):
         """Constructor"""
 
         super().__init__(id_list, in_dir, out_dir,
@@ -317,6 +345,14 @@ class FreesurferRatingWorkflow(BaseWorkflowVisualQC, ABC):
         self.suffix = self.expt_id
         self.current_alert_msg = None
         self.no_surface_vis = no_surface_vis
+        self.surface_vis_backend = surface_vis_backend or cfg.freesurfer_vis_cmd
+        if surface_worker_threads is None:
+            self.surface_worker_threads = cfg.default_surface_workers
+        elif surface_worker_threads < 1:
+            raise ValueError('surface_worker_threads must be >= 1')
+        else:
+            self.surface_worker_threads = surface_worker_threads
+        self._surface_backend_in_use = None
 
         self.alpha_mri = alpha_set[0]
         self.alpha_seg = alpha_set[1]
@@ -351,19 +387,55 @@ class FreesurferRatingWorkflow(BaseWorkflowVisualQC, ABC):
         """Generates surface visualizations."""
 
         print('\nAttempting to generate surface visualizations of parcellation ...')
-        self._freesurfer_installed, self._fs_vis_tool = \
-            freesurfer_vis_tool_installed()
-        if not self._freesurfer_installed:
-            print('Freesurfer does not seem to be installed '
-                  '- skipping surface visualizations.')
+        requested_backend = (self.surface_vis_backend or
+                             cfg.freesurfer_vis_cmd).lower()
+        backend_ready = False
+        backend_to_use = requested_backend
+        if requested_backend == 'pyvista':
+            if _prepare_pyvista_backend() is None:
+                print('PyVista backend is not available - skipping surface visualizations.')
+                return
+            backend_ready = True
+        else:
+            freesurfer_ready, default_backend = freesurfer_vis_tool_installed()
+            if not freesurfer_ready:
+                print('Freesurfer does not seem to be installed '
+                      '- skipping surface visualizations.')
+                return
+            backend_ready = True
+            if requested_backend not in ('freeview', 'tksurfer'):
+                backend_to_use = default_backend
+            elif which(requested_backend) is None:
+                print(f'Requested surface backend "{requested_backend}" is not available '
+                      f'- falling back to "{default_backend}".')
+                backend_to_use = default_backend
+            else:
+                backend_to_use = requested_backend
 
+        self._surface_backend_in_use = backend_to_use
+
+        def _generate_for_subject(subject_id):
+            return make_vis_pial_surface(self.in_dir, subject_id, self.out_dir,
+                                         backend_ready,
+                                         vis_tool=backend_to_use,
+                                         image_size=cfg.surface_vis_window_size)
+
+        max_workers = max(1, min(self.surface_worker_threads, len(self.id_list)))
         self.surface_vis_paths = dict()
-        for sid in self.id_list:
-            self.surface_vis_paths[sid] = \
-                make_vis_pial_surface(self.in_dir, sid, self.out_dir,
-                                      self._freesurfer_installed,
-                                      vis_tool=self._fs_vis_tool)
-
+        if max_workers == 1:
+            for sid in self.id_list:
+                self.surface_vis_paths[sid] = _generate_for_subject(sid)
+        else:
+            print(f'Generating surface visualizations using {max_workers} concurrent workers.')
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_generate_for_subject, sid): sid for sid in self.id_list}
+                for future in as_completed(futures):
+                    sid = futures[future]
+                    try:
+                        self.surface_vis_paths[sid] = future.result()
+                    except Exception:
+                        traceback.print_exc()
+                        self.surface_vis_paths[sid] = dict()
 
     def prepare_UI(self):
         """Main method to run the entire workflow"""
@@ -708,9 +780,10 @@ class FreesurferRatingWorkflow(BaseWorkflowVisualQC, ABC):
 
 
 def make_vis_pial_surface(fs_dir, subject_id, out_dir,
-                          FREESURFER_INSTALLED,
+                          backend_ready,
                           annot_file='aparc.annot',
-                          vis_tool=cfg.freesurfer_vis_cmd):
+                          vis_tool=cfg.freesurfer_vis_cmd,
+                          image_size=cfg.surface_vis_window_size):
     """Generate screenshot for the pial surface in different views"""
 
     fs_dir = Path(fs_dir).resolve()
@@ -728,12 +801,22 @@ def make_vis_pial_surface(fs_dir, subject_id, out_dir,
         vis_list[hemi_l] = dict()
         if vis_tool == "freeview":
             script_file, vis_files = make_freeview_script_vis_annot(
-                fs_dir, subject_id, hemi, out_vis_dir, annot_file)
+                fs_dir, subject_id, hemi, out_vis_dir, annot_file, image_size=image_size)
         elif vis_tool == "tksurfer":
             script_file, vis_files = make_tcl_script_vis_annot(
                 subject_id, hemi_l, out_vis_dir, annot_file)
+        elif vis_tool == "pyvista":
+            try:
+                vis_files = make_pyvista_surface_vis(
+                    fs_dir, subject_id, hemi, out_vis_dir, annot_file,
+                    window_size=image_size)
+                vis_list[hemi_l].update(vis_files)
+            except Exception:
+                traceback.print_exc()
+                print(f'Unable to generate PyVista surface visuals for {subject_id} {hemi}')
+            continue
         else:
-            pass
+            raise ValueError(f'Unsupported surface visualization backend "{vis_tool}"')
 
         # not running the scripts if required files dont exist
         surf_path = fs_dir / subject_id / 'surf' / '{}.pial'.format(hemi)
@@ -748,7 +831,7 @@ def make_vis_pial_surface(fs_dir, subject_id, out_dir,
         try:
             # run the script only if all the visualizations were not generated before
             all_vis_exist = all([vp.exists() for vp in vis_files.values()])
-            if not all_vis_exist and FREESURFER_INSTALLED:
+            if not all_vis_exist and backend_ready:
                 if vis_tool == "freeview":
                     _, _ = run_freeview_script(script_file)
                 elif vis_tool == "tksurfer":
@@ -775,7 +858,8 @@ def make_vis_pial_surface(fs_dir, subject_id, out_dir,
 
 
 def make_freeview_script_vis_annot(fs_dir, subject_id, hemi, out_vis_dir,
-                                   annot_file='aparc.annot'):
+                                   annot_file='aparc.annot',
+                                   image_size=cfg.surface_vis_window_size):
     """Generates a tksurfer script to make visualizations"""
 
     fs_dir = Path(fs_dir).resolve()
@@ -784,7 +868,7 @@ def make_freeview_script_vis_annot(fs_dir, subject_id, hemi, out_vis_dir,
     surf_path = fs_dir / subject_id / 'surf' / '{}.pial'.format(hemi)
     annot_path = fs_dir / subject_id / 'label' / '{}.{}'.format(hemi, annot_file)
 
-    script_file = out_vis_dir / 'vis_annot_{}.freeview.cmd'.format(hemi)
+    script_file = out_vis_dir / f'{subject_id}_vis_annot_{hemi}.freeview.cmd'
     vis_path = dict()
     for view in cfg.freeview_surface_vis_angles:
         vis_path[view] = out_vis_dir / '{}_{}_{}.png'.format(subject_id, hemi, view)
@@ -793,7 +877,9 @@ def make_freeview_script_vis_annot(fs_dir, subject_id, hemi, out_vis_dir,
     # --screenshot <FILENAME> <MAGIFICATION_FACTOR> <AUTO_TRIM>
     #   magnification factor: values other than 1 do not work on macos
 
-    common_options = "--layout 1 --viewport 3d --viewsize 1000 1000 --zoom 1.3 "
+    width, height = image_size
+    common_options = (f"--layout 1 --viewport 3d --viewsize {int(width)} {int(height)} "
+                      f"--zoom 1.3 ")
 
     cmds = list()
     # common files, surf and annot, for all the views
@@ -817,7 +903,7 @@ def make_freeview_script_vis_annot(fs_dir, subject_id, hemi, out_vis_dir,
 def make_tcl_script_vis_annot(subject_id, hemi, out_vis_dir, annot_file='aparc.annot'):
     """Generates a tksurfer script to make visualizations"""
 
-    script_file = out_vis_dir / f'vis_annot_{hemi}.tcl'
+    script_file = out_vis_dir / f'{subject_id}_vis_annot_{hemi}.tcl'
     vis = dict()
     for view in cfg.tksurfer_surface_vis_angles:
         vis[view] = out_vis_dir / f'{subject_id}_{hemi}_{view}.tif'
@@ -883,6 +969,126 @@ def run_freeview_script(script_file):
         exit_code = 0
 
     return txt_out, exit_code
+
+
+def make_pyvista_surface_vis(fs_dir, subject_id, hemi, out_vis_dir,
+                             annot_file='aparc.annot',
+                             window_size=cfg.surface_vis_window_size):
+    """Renders cortical surfaces using PyVista."""
+
+    pv = _prepare_pyvista_backend()
+    if pv is None:
+        raise RuntimeError('PyVista backend not available.')
+
+    surf_path = Path(fs_dir) / subject_id / 'surf' / f'{hemi}.pial'
+    annot_path = Path(fs_dir) / subject_id / 'label' / f'{hemi}.{annot_file}'
+    if (not surf_path.exists()) or (not annot_path.exists()):
+        raise FileNotFoundError(f'Missing inputs for {subject_id} {hemi}')
+
+    coords, faces = fsio.read_geometry(str(surf_path))
+    labels, ctab, _ = fsio.read_annot(str(annot_path))
+    faces = np.hstack((np.full((faces.shape[0], 1), 3, dtype=np.int64),
+                       faces.astype(np.int64)))
+
+    mesh = pv.PolyData(coords, faces)
+    vertex_colors = _labels_to_vertex_colors(labels, ctab)
+    mesh.point_data['parcellation'] = vertex_colors
+
+    window_size = tuple(int(val) for val in window_size)
+    plotter = pv.Plotter(off_screen=True, window_size=window_size)
+    plotter.set_background('white')
+    mesh_kwargs = dict(
+        scalars='parcellation',
+        rgb=True,
+        smooth_shading=True,
+        specular=0.4,
+        specular_power=15,
+        diffuse=0.65,
+        ambient=0.25,
+        name='surface'
+    )
+    plotter.add_mesh(mesh, **mesh_kwargs)
+    _add_default_lights(plotter, mesh)
+
+    vis = dict()
+    view_vectors = _get_camera_vectors(hemi)
+    for view in cfg.pyvista_surface_vis_angles:
+        if view not in view_vectors:
+            continue
+        cam_pos = _camera_position_for_view(mesh, view_vectors[view])
+        plotter.camera.position = cam_pos[0]
+        plotter.camera.focal_point = cam_pos[1]
+        plotter.camera.up = cam_pos[2]
+        plotter.render()
+        out_file = out_vis_dir / f'{subject_id}_{hemi}_{view}.png'
+        vis[view] = Path(plotter.screenshot(filename=str(out_file),
+                                            window_size=window_size,
+                                            return_img=False))
+    plotter.close()
+
+    return vis
+
+
+def _labels_to_vertex_colors(labels, ctab):
+    """Maps annotation labels to RGB colors."""
+
+    default_color = np.array([210, 210, 210], dtype=np.uint8)
+    if ctab is None or len(ctab) == 0:
+        cmap = (get_freesurfer_cmap() * 255).astype(np.uint8)
+        labels_safe = np.abs(labels.astype(np.int64))
+        idx = labels_safe % len(cmap)
+        return cmap[idx]
+
+    lut = {int(row[-1]): row[:3].astype(np.uint8) for row in ctab}
+    colors = np.tile(default_color, (labels.shape[0], 1))
+    for vidx, label in enumerate(labels):
+        if label in lut:
+            colors[vidx] = lut[label]
+    return colors
+
+
+def _get_camera_vectors(hemi):
+    """Returns camera direction and view-up vectors for each view."""
+
+    hemi = hemi.lower()
+    if hemi not in ('lh', 'rh'):
+        raise ValueError('Hemisphere must be lh or rh.')
+    sign = 1 if hemi == 'rh' else -1
+    return {
+        'lateral': (np.array([sign, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])),
+        'medial': (np.array([-sign, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])),
+        'inferior': (np.array([0.0, 0.0, -1.0]), np.array([0.0, 1.0, 0.0]))
+    }
+
+
+def _camera_position_for_view(mesh, view_tuple):
+    """Computes the camera placement for a given view."""
+
+    direction, view_up = view_tuple
+    center = np.array(mesh.center)
+    distance = mesh.length * 1.8
+    position = center + direction * distance
+    return (position.tolist(), center.tolist(), view_up.tolist())
+
+
+def _add_default_lights(plotter, mesh):
+    """Adds lights approximating Freeview aesthetics."""
+
+    pv = _prepare_pyvista_backend()
+    if pv is None:
+        return
+    center = np.array(mesh.center)
+    radius = mesh.length * 1.5
+    lights = [
+        pv.Light(position=(center + np.array([radius, radius, radius])).tolist(),
+                 color='white', intensity=0.6, light_type='scene light'),
+        pv.Light(position=(center + np.array([-radius, radius, radius])).tolist(),
+                 color='white', intensity=0.4, light_type='scene light'),
+        pv.Light(position=(center + np.array([0, -radius, radius])).tolist(),
+                 color='white', intensity=0.3, light_type='scene light')
+    ]
+    for light in lights:
+        plotter.add_light(light)
 
 
 def get_parser():
@@ -984,6 +1190,22 @@ def get_parser():
 
     Default: False (required visualizations are generated at the beginning, which can take 5-10 seconds for each subject).
     \n""")
+
+    help_text_surface_backend = textwrap.dedent("""
+    Selects the backend used to render cortical surfaces.  Choices include:
+    1) freeview (default, requires a Freesurfer install),
+    2) tksurfer (legacy Freesurfer tool), or
+    3) pyvista (pure Python rendering via nibabel + pyvista; does not require Freeview).
+
+    Default: {}.
+    \n""".format(cfg.freesurfer_vis_cmd))
+
+    help_text_surface_workers = textwrap.dedent("""
+    Number of parallel worker threads used to pre-compute surface screenshots.
+    Increase this on machines with many cores to speed up preprocessing.
+
+    Default: {}.
+    \n""".format(cfg.default_surface_workers))
 
     help_text_outlier_detection_method = textwrap.dedent("""
     Method used to detect the outliers.
@@ -1103,6 +1325,17 @@ def get_parser():
     wf_args.add_argument("-ns", "--no_surface_vis", action="store_true",
                          dest="no_surface_vis", help=help_text_no_surface_vis)
 
+    wf_args.add_argument("--surface_vis_backend", action="store",
+                         dest="surface_vis_backend",
+                         choices=cfg.surface_vis_backends,
+                         default=cfg.freesurfer_vis_cmd,
+                         help=help_text_surface_backend)
+
+    wf_args.add_argument("--surface_workers", action="store", type=int,
+                         dest="surface_workers",
+                         default=cfg.default_surface_workers,
+                         help=help_text_surface_workers)
+
     wf_args.add_argument("-so", "--screenshot_only", dest="screenshot_only",
                          action="store_true",
                          help=cfg.help_text_screenshot_only)
@@ -1154,6 +1387,11 @@ def make_workflow_from_user_options():
                              user_args.disable_outlier_detection,
                              id_list, vis_type, source_of_features)
 
+    surface_backend = user_args.surface_vis_backend
+    surface_workers = int(user_args.surface_workers)
+    if surface_workers < 1:
+        raise ValueError('surface_workers must be >= 1')
+
     wf = FreesurferRatingWorkflow(id_list,
                                   images_for_id,
                                   in_dir,
@@ -1173,7 +1411,9 @@ def make_workflow_from_user_options():
                                   views=views,
                                   num_slices_per_view=num_slices,
                                   num_rows_per_view=num_rows,
-                                  screenshot_only=user_args.screenshot_only)
+                                  screenshot_only=user_args.screenshot_only,
+                                  surface_vis_backend=surface_backend,
+                                  surface_worker_threads=surface_workers)
 
     return wf
 
