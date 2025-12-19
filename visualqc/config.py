@@ -16,6 +16,9 @@ required_files = (default_mri_name, default_seg_name)
 default_source_of_features_freesurfer = 'whole_brain'
 
 num_cortical_surface_vis = 6
+surface_vis_window_size = (1000, 1000)
+# ensures parallel workers don't starve CPU by default - user can override via CLI
+default_surface_workers = 1
 position_histogram_freesurfer = [0.905, 0.7, 0.09, 0.1]
 statistic_in_histogram_freesurfer = 'ThickAvg'
 title_histogram_freesurfer = 'mean thickness (label-wise)'
@@ -60,17 +63,22 @@ vis_types_with_multiple_ROIs = ('labels_volumetric', 'labels_contour')
 
 tksurfer_surface_vis_angles = ('lateral', 'medial', 'transverse')
 freeview_surface_vis_angles = ('lateral', 'medial', 'inferior')
+pyvista_surface_vis_angles = freeview_surface_vis_angles
 
 freesurfer_vis_cmd = 'freeview'
+surface_vis_backends = ('freeview', 'tksurfer', 'pyvista')
 
-view_pref_order = {'freeview': [('right', 'lateral'), ('left', 'lateral'),
-                                ('right', 'medial'), ('left', 'medial'),
-                                ('right', 'inferior'), ('left', 'inferior')]
-    ,
-                   'tksurfer': [('right', 'lateral'), ('left', 'lateral'),
-                                ('right', 'medial'), ('left', 'medial'),
-                                ('right', 'transverse'), ('left', 'transverse')]
-                   }
+view_pref_order = {
+    'freeview': [('right', 'lateral'), ('left', 'lateral'),
+                 ('right', 'medial'), ('left', 'medial'),
+                 ('right', 'inferior'), ('left', 'inferior')],
+    'tksurfer': [('right', 'lateral'), ('left', 'lateral'),
+                 ('right', 'medial'), ('left', 'medial'),
+                 ('right', 'transverse'), ('left', 'transverse')],
+    'pyvista': [('right', 'lateral'), ('left', 'lateral'),
+                ('right', 'medial'), ('left', 'medial'),
+                ('right', 'inferior'), ('left', 'inferior')]
+}
 
 default_label_set = None
 
